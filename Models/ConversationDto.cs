@@ -1,6 +1,6 @@
 
 using System.Text.Json.Serialization;
-using AIHappey.Common.Model;
+using AIHappey.Vercel.Models;
 
 namespace AIhappey.Core.Conversations.Models;
 
