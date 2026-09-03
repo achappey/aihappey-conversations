@@ -57,6 +57,31 @@ app.MapGet("/conversations", async (
     return Results.Ok(convos);
 }).RequireAuthorization();
 
+app.MapGet("/conversations/summaries", async (
+    IConversationStore store,
+    HttpContext ctx,
+    CancellationToken ct) =>
+{
+    var tenant = ctx.GetUserOid();
+    var summaries = await store.GetSummariesAsync(tenant, ct);
+    return Results.Ok(summaries);
+}).RequireAuthorization();
+
+app.MapGet("/conversations/search", async (
+    string? query,
+    int? limit,
+    IConversationStore store,
+    HttpContext ctx,
+    CancellationToken ct) =>
+{
+    if (string.IsNullOrWhiteSpace(query))
+        return Results.BadRequest(new { error = "A non-empty query is required." });
+
+    var tenant = ctx.GetUserOid();
+    var result = await store.SearchAsync(query, limit ?? 20, tenant, ct);
+    return Results.Ok(result);
+}).RequireAuthorization();
+
 app.MapGet("/conversations/{id}", async (
     string id,
     IConversationStore store,
