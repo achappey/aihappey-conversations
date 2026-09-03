@@ -1,6 +1,8 @@
 using AIhappey.Core.Conversations.Extensions;
+using AIhappey.Core.Conversations.MCP;
 using AIhappey.Core.Conversations.Models;
 using AIhappey.Core.Conversations.Services;
+using AIHappey.Common.MCP;
 using Azure.Storage.Blobs;
 using Microsoft.AspNetCore.Authentication.JwtBearer;
 using Microsoft.Identity.Web;
@@ -10,6 +12,10 @@ var builder = WebApplication.CreateBuilder(args);
 builder.Services.AddAuthentication(JwtBearerDefaults.AuthenticationScheme)
     .AddMicrosoftIdentityWebApi(builder.Configuration.GetSection("AzureAd"));
 builder.Services.AddAuthorization();
+builder.Services.AddHttpContextAccessor();
+
+var mcpServers = ConversationMcpDefinitions.GetDefinitions().ToList();
+builder.Services.AddMcpServers(mcpServers);
 
 builder.WebHost.ConfigureKestrel(o =>
 {
@@ -46,6 +52,9 @@ var app = builder.Build();
 app.UseCors();
 app.UseAuthentication();
 app.UseAuthorization();
+
+app.MapMcpEndpoints(mcpServers, requireAuth: true);
+app.MapMcpRegistry(mcpServers);
 
 app.MapGet("/conversations", async (
     IConversationStore store,
