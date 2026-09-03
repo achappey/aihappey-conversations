@@ -11,6 +11,7 @@ namespace AIhappey.Core.Conversations.Services;
 public sealed class BlobConversationStore(BlobContainerClient container) : IConversationStore
 {
     static readonly JsonSerializerOptions JsonOptions = new(JsonSerializerDefaults.Web);
+    const int MutationAttempts = 5;
     const string NameMetadataKey = "aihname";
     const string MessageCountMetadataKey = "aihmessagecount";
     const string ActivityAtMetadataKey = "aihactivityat";
@@ -70,6 +71,127 @@ public sealed class BlobConversationStore(BlobContainerClient container) : IConv
 
     public async Task UpdateAsync(ConversationDto conversation, string? tenantId = null, CancellationToken ct = default) =>
         await SaveAsync(conversation, tenantId, ct);
+
+    public Task<ConversationMutationResult> AddMessageAsync(
+        string conversationId,
+        AIHappey.Vercel.Models.UIMessage message,
+        string? tenantId = null,
+        CancellationToken ct = default) =>
+        MutateAsync(
+            conversationId,
+            conversation =>
+            {
+                // A repeated POST can happen when a client retries after losing the
+                // response. Treat the stable message id as the idempotency key.
+                if (conversation.Messages.Any(item => item.Id == message.Id))
+                    return ConversationMutationResult.NoChange;
+
+                conversation.Messages.Add(message);
+                return ConversationMutationResult.Success;
+            },
+            tenantId,
+            ct);
+
+    public Task<ConversationMutationResult> UpdateMessageAsync(
+        string conversationId,
+        string messageId,
+        ConversationMessagePatchDto patch,
+        string? tenantId = null,
+        CancellationToken ct = default) =>
+        MutateAsync(
+            conversationId,
+            conversation =>
+            {
+                var index = conversation.Messages.FindIndex(item => item.Id == messageId);
+                if (index < 0) return ConversationMutationResult.MessageNotFound;
+
+                var current = conversation.Messages[index];
+                conversation.Messages[index] = new AIHappey.Vercel.Models.UIMessage
+                {
+                    Id = current.Id,
+                    Role = patch.Role ?? current.Role,
+                    Parts = patch.Parts ?? current.Parts,
+                    Metadata = patch.MetadataSpecified ? patch.Metadata : current.Metadata
+                };
+                return ConversationMutationResult.Success;
+            },
+            tenantId,
+            ct);
+
+    public Task<ConversationMutationResult> DeleteMessageAsync(
+        string conversationId,
+        string messageId,
+        string? tenantId = null,
+        CancellationToken ct = default) =>
+        MutateAsync(
+            conversationId,
+            conversation =>
+            {
+                var index = conversation.Messages.FindIndex(item => item.Id == messageId);
+                if (index < 0) return ConversationMutationResult.MessageNotFound;
+
+                conversation.Messages.RemoveAt(index);
+                return ConversationMutationResult.Success;
+            },
+            tenantId,
+            ct);
+
+    async Task<ConversationMutationResult> MutateAsync(
+        string conversationId,
+        Func<ConversationDto, ConversationMutationResult> mutate,
+        string? tenantId,
+        CancellationToken ct)
+    {
+        var blob = container.GetBlobClient(BuildBlobName(conversationId, tenantId));
+
+        for (var attempt = 0; attempt < MutationAttempts; attempt++)
+        {
+            Azure.Response<BlobDownloadResult> download;
+            try
+            {
+                download = await blob.DownloadContentAsync(ct);
+            }
+            catch (RequestFailedException ex) when (ex.Status == 404)
+            {
+                return ConversationMutationResult.ConversationNotFound;
+            }
+
+            var conversation = download.Value.Content.ToObjectFromJson<ConversationDto>(JsonOptions);
+            if (conversation is null)
+                throw new InvalidDataException($"Conversation '{conversationId}' could not be deserialized.");
+
+            var result = mutate(conversation);
+            if (result != ConversationMutationResult.Success) return result;
+
+            var metadata = new Dictionary<string, string>(
+                download.Value.Details.Metadata,
+                StringComparer.OrdinalIgnoreCase);
+            var activityAt = GetLatestActivity(conversation)
+                ?? download.Value.Details.LastModified;
+            WriteSummaryMetadata(metadata, GetName(conversation), conversation.Messages.Count, activityAt);
+
+            var options = new BlobUploadOptions
+            {
+                Metadata = metadata,
+                Conditions = new BlobRequestConditions { IfMatch = download.Value.Details.ETag }
+            };
+
+            try
+            {
+                await blob.UploadAsync(BinaryData.FromObjectAsJson(conversation, JsonOptions), options, ct);
+                return ConversationMutationResult.Success;
+            }
+            catch (RequestFailedException ex) when ((ex.Status is 409 or 412) && attempt + 1 < MutationAttempts)
+            {
+                // Re-read and re-apply the mutation rather than overwriting a
+                // concurrent writer with the stale conversation body.
+                await Task.Delay(TimeSpan.FromMilliseconds(25 * (attempt + 1)), ct);
+            }
+        }
+
+        throw new InvalidOperationException(
+            $"Conversation '{conversationId}' changed too frequently to apply the message mutation safely.");
+    }
 
     public async Task<IEnumerable<ConversationDto>> GetAllAsync(string? tenantId = null, CancellationToken ct = default)
     {

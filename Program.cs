@@ -76,6 +76,13 @@ app.MapGet("/conversations/summaries", async (
     return Results.Ok(summaries);
 }).RequireAuthorization();
 
+// Allows a newer client to distinguish an older deployment (safe legacy PUT
+// fallback) from a missing conversation returned by a message mutation.
+app.MapGet("/conversations/capabilities", () => Results.Ok(new
+{
+    granularMessageMutations = true
+})).RequireAuthorization();
+
 app.MapGet("/conversations/search", async (
     string? query,
     int? limit,
@@ -124,6 +131,65 @@ app.MapPut("/conversations/{id}", async (
     if (dto.Id != id) return Results.BadRequest();
     await store.UpdateAsync(dto, tenant, ct);
     return Results.NoContent();
+}).RequireAuthorization();
+
+app.MapPost("/conversations/{id}/messages", async (
+    string id,
+    AIHappey.Vercel.Models.UIMessage message,
+    IConversationStore store,
+    HttpContext ctx,
+    CancellationToken ct) =>
+{
+    if (string.IsNullOrWhiteSpace(id) || string.IsNullOrWhiteSpace(message.Id))
+        return Results.BadRequest(new { error = "Conversation and message ids are required." });
+
+    var result = await store.AddMessageAsync(id, message, ctx.GetUserOid(), ct);
+    return result switch
+    {
+        ConversationMutationResult.Success => Results.Created($"/conversations/{id}/messages/{message.Id}", null),
+        ConversationMutationResult.NoChange => Results.NoContent(),
+        ConversationMutationResult.ConversationNotFound => Results.NotFound(),
+        _ => Results.Conflict()
+    };
+}).RequireAuthorization();
+
+app.MapPatch("/conversations/{id}/messages/{messageId}", async (
+    string id,
+    string messageId,
+    ConversationMessagePatchDto patch,
+    IConversationStore store,
+    HttpContext ctx,
+    CancellationToken ct) =>
+{
+    if (string.IsNullOrWhiteSpace(id) || string.IsNullOrWhiteSpace(messageId))
+        return Results.BadRequest(new { error = "Conversation and message ids are required." });
+
+    var result = await store.UpdateMessageAsync(id, messageId, patch, ctx.GetUserOid(), ct);
+    return result switch
+    {
+        ConversationMutationResult.Success or ConversationMutationResult.NoChange => Results.NoContent(),
+        ConversationMutationResult.ConversationNotFound or ConversationMutationResult.MessageNotFound => Results.NotFound(),
+        _ => Results.Conflict()
+    };
+}).RequireAuthorization();
+
+app.MapDelete("/conversations/{id}/messages/{messageId}", async (
+    string id,
+    string messageId,
+    IConversationStore store,
+    HttpContext ctx,
+    CancellationToken ct) =>
+{
+    if (string.IsNullOrWhiteSpace(id) || string.IsNullOrWhiteSpace(messageId))
+        return Results.BadRequest(new { error = "Conversation and message ids are required." });
+
+    var result = await store.DeleteMessageAsync(id, messageId, ctx.GetUserOid(), ct);
+    return result switch
+    {
+        ConversationMutationResult.Success => Results.NoContent(),
+        ConversationMutationResult.ConversationNotFound or ConversationMutationResult.MessageNotFound => Results.NotFound(),
+        _ => Results.Conflict()
+    };
 }).RequireAuthorization();
 
 app.MapDelete("/conversations/{id}", async (
