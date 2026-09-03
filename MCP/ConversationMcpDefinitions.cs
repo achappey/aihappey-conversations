@@ -13,8 +13,8 @@ public static class ConversationMcpDefinitions
             ToolTypes: [typeof(ConversationTools)]);
 
         yield return new McpServerDefinition(
-            Name: "AI-Memories",
-            Title: "AI Memories",
+            Name: "AI-UserMemories",
+            Title: "AI User Memories",
             Description: "Create, list, read, update, and delete the current user's memories.",
             ToolTypes: [typeof(UserMemoryTools)]);
     }
