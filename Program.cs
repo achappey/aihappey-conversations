@@ -35,6 +35,7 @@ builder.Services.AddSingleton(_ =>
 });
 
 builder.Services.AddSingleton<IConversationStore, BlobConversationStore>();
+builder.Services.AddSingleton<IUserMemoryStore, BlobUserMemoryStore>();
 
 // CORS for SPA (adjust origin as needed)
 builder.Services.AddCors(options =>

@@ -9,7 +9,13 @@ public static class ConversationMcpDefinitions
         yield return new McpServerDefinition(
             Name: "AI-Conversations",
             Title: "AI Conversations",
-            Description: "List, read, and search the authenticated user's conversations.",
+            Description: "List, read, and search the current user's conversations.",
             ToolTypes: [typeof(ConversationTools)]);
+
+        yield return new McpServerDefinition(
+            Name: "AI-Memories",
+            Title: "AI Memories",
+            Description: "Create, list, read, update, and delete the current user's memories.",
+            ToolTypes: [typeof(UserMemoryTools)]);
     }
 }
