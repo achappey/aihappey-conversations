@@ -11,6 +11,7 @@ namespace AIhappey.Core.Conversations.Services;
 public sealed class BlobConversationStore(BlobContainerClient container) : IConversationStore
 {
     static readonly JsonSerializerOptions JsonOptions = new(JsonSerializerDefaults.Web);
+    readonly ConversationAttachmentStorage attachmentStorage = new(container);
     const int MutationAttempts = 5;
     const string NameMetadataKey = "aihname";
     const string MessageCountMetadataKey = "aihmessagecount";
@@ -20,22 +21,97 @@ public sealed class BlobConversationStore(BlobContainerClient container) : IConv
     public async Task<bool> DeleteAsync(string id, string? tenantId = null, CancellationToken ct = default)
     {
         var blob = container.GetBlobClient(BuildBlobName(id, tenantId));
-        var exists = await blob.ExistsAsync(ct);
-        if (!exists) return false;
-        await blob.DeleteAsync(cancellationToken: ct);
+        if (!(await blob.DeleteIfExistsAsync(cancellationToken: ct)).Value) return false;
+
+        var attachmentPrefix = BuildAttachmentPrefix(id, tenantId);
+        await foreach (var item in container.GetBlobsAsync(
+            traits: BlobTraits.None,
+            states: BlobStates.None,
+            prefix: attachmentPrefix,
+            cancellationToken: ct))
+            await container.DeleteBlobIfExistsAsync(item.Name, cancellationToken: ct);
+
         return true;
     }
 
-    public async Task<ConversationDto?> GetAsync(string id, string? tenantId = null, CancellationToken ct = default)
+    public Task<ConversationDto?> GetAsync(string id, string? tenantId = null, CancellationToken ct = default) =>
+        ReadAsync(id, tenantId, hydrateAttachments: true, ct);
+
+    public Task<ConversationDto?> GetWithoutAttachmentDataAsync(
+        string id,
+        string? tenantId = null,
+        CancellationToken ct = default) =>
+        ReadAsync(id, tenantId, hydrateAttachments: false, ct);
+
+    async Task<ConversationDto?> ReadAsync(
+        string id,
+        string? tenantId,
+        bool hydrateAttachments,
+        CancellationToken ct)
     {
         var blob = container.GetBlobClient(BuildBlobName(id, tenantId));
-        if (!await blob.ExistsAsync(ct)) return null;
-        var resp = await blob.DownloadContentAsync(ct);
-        return resp.Value.Content.ToObjectFromJson<ConversationDto>(JsonOptions);
+
+        for (var attempt = 0; attempt < MutationAttempts; attempt++)
+        {
+            BlobDownloadResult download;
+            try
+            {
+                download = (await blob.DownloadContentAsync(ct)).Value;
+            }
+            catch (RequestFailedException ex) when (ex.Status == 404)
+            {
+                return null;
+            }
+
+            var conversation = download.Content.ToObjectFromJson<ConversationDto>(JsonOptions);
+            if (conversation is null)
+                throw new InvalidDataException($"Conversation '{id}' could not be deserialized.");
+
+            var migrated = await attachmentStorage.ExternalizeAsync(
+                conversation,
+                BuildAttachmentPrefix(id, tenantId),
+                rejectMalformedDataUris: false,
+                ct);
+
+            if (migrated)
+            {
+                var options = new BlobUploadOptions
+                {
+                    Metadata = download.Details.Metadata,
+                    Conditions = new BlobRequestConditions { IfMatch = download.Details.ETag }
+                };
+
+                try
+                {
+                    await blob.UploadAsync(BinaryData.FromObjectAsJson(conversation, JsonOptions), options, ct);
+                }
+                catch (RequestFailedException ex) when ((ex.Status is 409 or 412) && attempt + 1 < MutationAttempts)
+                {
+                    await Task.Delay(TimeSpan.FromMilliseconds(25 * (attempt + 1)), ct);
+                    continue;
+                }
+            }
+
+            if (hydrateAttachments)
+                await attachmentStorage.HydrateAsync(conversation, BuildAttachmentPrefix(id, tenantId), ct);
+
+            return conversation;
+        }
+
+        throw new InvalidOperationException(
+            $"Conversation '{id}' changed too frequently to migrate its attachments safely.");
     }
 
     public async Task SaveAsync(ConversationDto conversation, string? tenantId = null, CancellationToken ct = default)
     {
+        ValidateIncomingConversation(conversation);
+        var storedConversation = ConversationAttachmentStorage.CloneConversation(conversation);
+        await attachmentStorage.ExternalizeAsync(
+            storedConversation,
+            BuildAttachmentPrefix(conversation.Id, tenantId),
+            rejectMalformedDataUris: true,
+            ct);
+
         var blob = container.GetBlobClient(BuildBlobName(conversation.Id, tenantId));
         BlobProperties? properties = null;
         try
@@ -66,7 +142,16 @@ public sealed class BlobConversationStore(BlobContainerClient container) : IConv
         else
             options.Conditions = new BlobRequestConditions { IfNoneMatch = ETag.All };
 
-        await blob.UploadAsync(BinaryData.FromObjectAsJson(conversation, JsonOptions), options, ct);
+        await blob.UploadAsync(BinaryData.FromObjectAsJson(storedConversation, JsonOptions), options, ct);
+    }
+
+    static void ValidateIncomingConversation(ConversationDto conversation)
+    {
+        if (string.IsNullOrWhiteSpace(conversation.Id))
+            throw new ArgumentException("A non-empty conversation id is required.", nameof(conversation));
+
+        foreach (var message in conversation.Messages)
+            ConversationAttachmentStorage.ValidateIncomingParts(message.Parts);
     }
 
     public async Task UpdateAsync(ConversationDto conversation, string? tenantId = null, CancellationToken ct = default) =>
@@ -76,8 +161,10 @@ public sealed class BlobConversationStore(BlobContainerClient container) : IConv
         string conversationId,
         AIHappey.Vercel.Models.UIMessage message,
         string? tenantId = null,
-        CancellationToken ct = default) =>
-        MutateAsync(
+        CancellationToken ct = default)
+    {
+        ConversationAttachmentStorage.ValidateIncomingParts(message.Parts);
+        return MutateAsync(
             conversationId,
             conversation =>
             {
@@ -86,19 +173,24 @@ public sealed class BlobConversationStore(BlobContainerClient container) : IConv
                 if (conversation.Messages.Any(item => item.Id == message.Id))
                     return ConversationMutationResult.NoChange;
 
-                conversation.Messages.Add(message);
+                conversation.Messages.Add(ConversationAttachmentStorage.CloneMessage(message));
                 return ConversationMutationResult.Success;
             },
             tenantId,
             ct);
+    }
 
     public Task<ConversationMutationResult> UpdateMessageAsync(
         string conversationId,
         string messageId,
         ConversationMessagePatchDto patch,
         string? tenantId = null,
-        CancellationToken ct = default) =>
-        MutateAsync(
+        CancellationToken ct = default)
+    {
+        if (patch.Parts is not null)
+            ConversationAttachmentStorage.ValidateIncomingParts(patch.Parts);
+
+        return MutateAsync(
             conversationId,
             conversation =>
             {
@@ -110,13 +202,16 @@ public sealed class BlobConversationStore(BlobContainerClient container) : IConv
                 {
                     Id = current.Id,
                     Role = patch.Role ?? current.Role,
-                    Parts = patch.Parts ?? current.Parts,
+                    Parts = patch.Parts is null
+                        ? current.Parts
+                        : ConversationAttachmentStorage.CloneParts(patch.Parts),
                     Metadata = patch.MetadataSpecified ? patch.Metadata : current.Metadata
                 };
                 return ConversationMutationResult.Success;
             },
             tenantId,
             ct);
+    }
 
     public Task<ConversationMutationResult> DeleteMessageAsync(
         string conversationId,
@@ -163,6 +258,12 @@ public sealed class BlobConversationStore(BlobContainerClient container) : IConv
             var result = mutate(conversation);
             if (result != ConversationMutationResult.Success) return result;
 
+            await attachmentStorage.ExternalizeAsync(
+                conversation,
+                BuildAttachmentPrefix(conversationId, tenantId),
+                rejectMalformedDataUris: false,
+                ct);
+
             var metadata = new Dictionary<string, string>(
                 download.Value.Details.Metadata,
                 StringComparer.OrdinalIgnoreCase);
@@ -204,9 +305,8 @@ public sealed class BlobConversationStore(BlobContainerClient container) : IConv
 
         await foreach (var item in container.GetBlobsAsync(options, cancellationToken: ct))
         {
-            var blobClient = container.GetBlobClient(item.Name);
-            var resp = await blobClient.DownloadContentAsync(ct);
-            var dto = resp.Value.Content.ToObjectFromJson<ConversationDto>(JsonOptions);
+            if (!TryGetId(item.Name, prefix, out var id)) continue;
+            var dto = await GetAsync(id, tenantId, ct);
             if (dto is not null) results.Add(dto);
         }
         return results;
@@ -272,7 +372,7 @@ public sealed class BlobConversationStore(BlobContainerClient container) : IConv
             if (results.Count >= cappedLimit) break;
             if (!TryGetId(item.Name, prefix, out var id)) continue;
 
-            var conversation = await GetAsync(id, tenantId, ct);
+            var conversation = await GetWithoutAttachmentDataAsync(id, tenantId, ct);
             if (conversation is null) continue;
 
             for (var messageIndex = 0; messageIndex < conversation.Messages.Count && results.Count < cappedLimit; messageIndex++)
@@ -518,4 +618,7 @@ public sealed class BlobConversationStore(BlobContainerClient container) : IConv
 
     static string BuildBlobName(string id, string? tenantId)
         => $"{BuildPrefix(tenantId)}{id}.json";
+
+    static string BuildAttachmentPrefix(string id, string? tenantId)
+        => $"{BuildPrefix(tenantId)}{id}/attachments/";
 }

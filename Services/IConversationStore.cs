@@ -14,6 +14,7 @@ public enum ConversationMutationResult
 public interface IConversationStore
 {
     Task<ConversationDto?> GetAsync(string id, string? userId = null, CancellationToken ct = default);
+    Task<ConversationDto?> GetWithoutAttachmentDataAsync(string id, string? userId = null, CancellationToken ct = default);
     Task SaveAsync(ConversationDto conversation, string? userId = null, CancellationToken ct = default);
     Task UpdateAsync(ConversationDto conversation, string? userId = null, CancellationToken ct = default);
     Task<ConversationMutationResult> AddMessageAsync(

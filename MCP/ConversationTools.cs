@@ -56,7 +56,7 @@ public static class ConversationTools
             throw new McpException("A non-empty conversationId is required.");
 
         var (store, userId) = ResolveUserStore(services);
-        var conversation = await store.GetAsync(conversationId, userId, ct)
+        var conversation = await store.GetWithoutAttachmentDataAsync(conversationId, userId, ct)
             ?? throw new McpException("Conversation not found.");
 
         return new CallToolResult

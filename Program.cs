@@ -5,6 +5,7 @@ using AIhappey.Core.Conversations.Services;
 using AIHappey.Common.MCP;
 using Azure.Storage.Blobs;
 using Microsoft.AspNetCore.Authentication.JwtBearer;
+using Microsoft.AspNetCore.Diagnostics;
 using Microsoft.Identity.Web;
 
 var builder = WebApplication.CreateBuilder(args);
@@ -49,6 +50,15 @@ builder.Services.AddCors(options =>
 });
 
 var app = builder.Build();
+app.UseExceptionHandler(errorApp => errorApp.Run(async context =>
+{
+    var error = context.Features.Get<IExceptionHandlerFeature>()?.Error;
+    if (error is not InvalidConversationAttachmentException attachmentError)
+        return;
+
+    context.Response.StatusCode = StatusCodes.Status400BadRequest;
+    await context.Response.WriteAsJsonAsync(new { error = attachmentError.Message });
+}));
 app.UseCors();
 app.UseAuthentication();
 app.UseAuthorization();
