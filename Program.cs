@@ -11,6 +11,13 @@ builder.Services.AddAuthentication(JwtBearerDefaults.AuthenticationScheme)
     .AddMicrosoftIdentityWebApi(builder.Configuration.GetSection("AzureAd"));
 builder.Services.AddAuthorization();
 
+builder.WebHost.ConfigureKestrel(o =>
+{
+    o.Limits.KeepAliveTimeout = TimeSpan.FromSeconds(230);
+    o.Limits.RequestHeadersTimeout = TimeSpan.FromSeconds(230);
+    o.Limits.MaxRequestBodySize = null;
+});
+
 builder.Services.AddSingleton(_ =>
 {
     var conn = builder.Configuration["Storage:ConnectionString"];
